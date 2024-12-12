@@ -1,13 +1,63 @@
-import asyncio
 import random
+import time
+import threading
 
+from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
 
 from app.db import async_session, init_db
 from app.models import Task
+from app.db import engine
 
-from contextlib import asynccontextmanager
+from sqlalchemy.orm import sessionmaker
+
+task_queue = deque()
+queue_lock = threading.Lock()
+
+
+def process_task(task_id: int):
+    """Синхронная обработка задачи"""
+    with sessionmaker(bind=engine.sync_engine)() as session:
+        with queue_lock:
+            task = session.get(Task, task_id)
+            if not task:
+                return
+
+            task.status = "Run"
+            task.start_time = datetime.now()
+            session.commit()
+
+        # заглушка
+        execute_time = random.randint(1, 10)
+        time.sleep(execute_time)
+
+        with queue_lock:
+            task.status = "Completed"
+            task.time_to_execute = execute_time
+            session.commit()
+
+
+def task_worker():
+    """Воркер выполняет задачи поочередно по мере поступления"""
+    while True:
+        with queue_lock:
+            if not task_queue:
+                continue
+            task_id = task_queue.popleft()
+
+        process_task(task_id)
+
+
+worker_threads = []
+
+# Максимальное количество обрабатываемых одновременно задач
+MAX_TASKS = 2
+for _ in range(MAX_TASKS):
+    thread = threading.Thread(target=task_worker, daemon=True)
+    thread.start()
+    worker_threads.append(thread)
 
 
 @asynccontextmanager
@@ -17,33 +67,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-# Максимальное количество обрабатываемых одновременно задач
-MAX_TASKS = 2
-
 app = FastAPI(lifespan=lifespan)
-semaphore = asyncio.Semaphore(MAX_TASKS)
-
-
-async def process_task(task_id: int):
-    """Обработка задачи"""
-    async with semaphore:
-        async with async_session() as session:
-            task = await session.get(Task, task_id)
-            task.status = "Run"
-            task.start_time = datetime.now()
-            await session.commit()
-
-            # заглушка
-            execute_time = random.randint(1, 10)
-            await asyncio.sleep(execute_time)
-
-            task.status = "Completed"
-            task.time_to_execute = execute_time
-            await session.commit()
 
 
 @app.post("/tasks")
-async def create_task(background_tasks: BackgroundTasks):
+async def create_task():
     """Добавление задачи в очередь"""
     async with async_session() as session:
         task = Task()
@@ -51,7 +79,9 @@ async def create_task(background_tasks: BackgroundTasks):
         await session.commit()
         await session.refresh(task)
 
-        background_tasks.add_task(process_task, task.id)
+        with queue_lock:
+            task_queue.append(task.id)
+
         return {"task_id": task.id}
 
 
